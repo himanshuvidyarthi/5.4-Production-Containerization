@@ -1,0 +1,127 @@
+# docker-compose.yml — EPOCH cluster declaration
+# Run:        docker compose up
+# Stop:       docker compose down
+# Wipe state: docker compose down --volumes   ← deletes pg_data, redis_data
+
+networks:
+  backplane:
+    driver: bridge
+    # All east-west inter-service traffic. Never exposed to host.
+  gateway:
+    driver: bridge
+    # Single entry point from outside. Only fastapi sits here.
+
+volumes:
+  pg_data:        # Postgres state — survives compose down
+  redis_data:     # Redis state
+  hf_cache:       # HuggingFace weights — expensive to re-download
+  epoch_indexes:  # FAISS per-expert indexes (Session 15.1)
+
+services:
+
+  # ── Layer 1: boots in parallel (no upstream deps) ─────────────────────
+  postgres:
+    image: postgres:16-alpine
+    networks: [backplane]
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER:     ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB:       ${PG_DB}
+    expose: ["5432"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${PG_USER}", "-d", "${PG_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    networks: [backplane]
+    volumes:
+      - redis_data:/data
+    expose: ["6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  vllm:
+    # GPU path:       build: ./services/vllm (nvidia/cuda:runtime)
+    # CPU stub path:  build: {context: ./services/vllm, dockerfile: Dockerfile.stub}
+    build:
+      context: ./services/vllm
+      dockerfile: Dockerfile.stub    # change to Dockerfile for real GPU
+    networks: [backplane]
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+      - epoch_indexes:/mnt/indexes
+    env_file: [.env]
+    expose: ["8000"]
+    # Uncomment for real GPU:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s   # stub: 30s | real vLLM: 120s (model weight load)
+      retries: 3
+    restart: unless-stopped
+
+  # ── Layer 2: waits for vllm ───────────────────────────────────────────
+  litellm:
+    image: ghcr.io/berriai/litellm:main
+    networks: [backplane]
+    volumes:
+      - ./services/litellm/config.yaml:/app/proxy_server_config.yaml:ro
+    env_file: [.env]
+    expose: ["4000"]
+    # NOTE: the litellm image's ENTRYPOINT is a fixed shell string that
+    # always runs `litellm --config /app/proxy_server_config.yaml --port 4000`
+    # — it does not forward CMD/command args, so command: here is a no-op.
+    # The config must be mounted at that exact hardcoded path.
+    depends_on:
+      vllm:
+        condition: service_healthy
+    healthcheck:
+      # litellm's base image ships neither curl nor wget — use python3,
+      # which is present, instead.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+    restart: unless-stopped
+
+  # ── Layer 3: waits for litellm + redis + postgres ─────────────────────
+  fastapi:
+    build: ./services/fastapi
+    networks:
+      - backplane   # east-west: talks to litellm, redis, postgres
+      - gateway     # north-south: accepts client connections on port 8000
+    ports:
+      - "8000:8000"   # ONLY service with a ports: mapping
+    env_file: [.env]
+    depends_on:
+      litellm:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped

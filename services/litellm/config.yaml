@@ -1,0 +1,23 @@
+model_list:
+  - model_name: epoch-default
+    litellm_params:
+      # vLLM via OpenAI-compatible endpoint.
+      # Container DNS: http://vllm:8000 — never localhost:8000
+      model:    openai/meta-llama/Llama-3.1-8B-Instruct
+      api_base: http://vllm:8000/v1
+      api_key:  unused
+
+  - model_name: epoch-default
+    litellm_params:
+      # Gemini fallback when vLLM unavailable
+      model:   gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+router_settings:
+  routing_strategy: least-busy
+  num_retries: 2
+  retry_after: 5
+  timeout: 60
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
